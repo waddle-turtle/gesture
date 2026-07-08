@@ -1,0 +1,9 @@
+# 忽略 Python 暫存檔
+__pycache__/
+*.pyc
+
+# 忽略虛擬環境
+mj_env/
+
+# 忽略 VS Code 暫存設定
+.vscode/
