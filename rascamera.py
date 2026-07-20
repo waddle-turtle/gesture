@@ -5,6 +5,7 @@ import numpy as np
 import threading
 import time
 import serial
+
 from flask import Flask, Response, jsonify
 
 
@@ -26,7 +27,7 @@ serial_lock = threading.Lock()
 
 def connect_arduino():
     """
-    連接 Arduino。
+    建立 Raspberry Pi 與 Arduino 的序列連線。
 
     Arduino 開啟序列埠時通常會重新啟動，
     因此連線後等待 2 秒再開始傳送指令。
@@ -54,6 +55,7 @@ def connect_arduino():
         print(f"警告：Arduino 連線失敗：{error}")
 
 
+# 程式啟動時先連接 Arduino
 connect_arduino()
 
 
@@ -89,25 +91,29 @@ current_finger_count = 0
 active_motor_port = -1
 current_action_cmd = "IDLE"
 
-# 手勢穩定判斷
+# 目前正在確認的手指數量
 candidate_finger_count = -1
+
+# 該手勢已連續出現的辨識次數
 candidate_frame_count = 0
 
-# 需要連續辨識相同幀數才觸發
+# 同一手勢連續出現多少次才觸發
 STABLE_FRAMES_REQUIRED = 5
 
-# 上一次已傳送的手勢
+# 上一次已成功傳送的手勢
 last_sent_finger_count = -1
 
-# 避免動作尚未結束就快速傳送下一筆
+# 上一次傳送指令的時間
 last_command_time = 0.0
+
+# 避免短時間內傳送太多動作指令
 COMMAND_COOLDOWN_SECONDS = 1.5
 
 state_lock = threading.Lock()
 
 
 # =========================================================
-# Arduino 指令映射
+# 手指數量與 Arduino 指令映射
 # =========================================================
 ACTION_MAPPING = {
     1: {
@@ -119,6 +125,11 @@ ACTION_MAPPING = {
         "command": "2",
         "action_name": "JUMP_BODY",
         "motor_port": 15
+    },
+    3: {
+        "command": "3",
+        "action_name": "COMBO_PUNCH",
+        "motor_port": "12+8"
     }
 }
 
@@ -128,10 +139,10 @@ ACTION_MAPPING = {
 # =========================================================
 def send_arduino_command(command):
     """
-    將一筆完整指令傳給 Arduino。
+    將一筆完整指令傳送給 Arduino。
 
-    Arduino 使用 readStringUntil('\\n')，
-    所以每筆指令最後一定要加上換行符號。
+    Arduino 使用 Serial.readStringUntil('\\n')，
+    所以每筆指令最後必須加入換行符號。
     """
     global arduino
 
@@ -149,7 +160,10 @@ def send_arduino_command(command):
         print(f"已傳送 Arduino 指令：{command}")
         return True
 
-    except (serial.SerialException, serial.SerialTimeoutException) as error:
+    except (
+        serial.SerialException,
+        serial.SerialTimeoutException
+    ) as error:
         print(f"Arduino 指令傳送失敗：{error}")
         return False
 
@@ -201,19 +215,34 @@ def camera_thread():
         byte_buffer += chunk
 
         start_index = byte_buffer.find(b"\xff\xd8")
-        end_index = byte_buffer.find(b"\xff\xd9", start_index + 2)
 
-        if start_index == -1 or end_index == -1:
-            # 避免異常狀況下緩衝區持續變大
+        if start_index == -1:
             if len(byte_buffer) > 4 * 1024 * 1024:
                 byte_buffer = b""
+            continue
+
+        end_index = byte_buffer.find(
+            b"\xff\xd9",
+            start_index + 2
+        )
+
+        if end_index == -1:
+            if len(byte_buffer) > 4 * 1024 * 1024:
+                byte_buffer = byte_buffer[start_index:]
             continue
 
         jpg_data = byte_buffer[start_index:end_index + 2]
         byte_buffer = byte_buffer[end_index + 2:]
 
-        image_array = np.frombuffer(jpg_data, dtype=np.uint8)
-        frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        image_array = np.frombuffer(
+            jpg_data,
+            dtype=np.uint8
+        )
+
+        frame = cv2.imdecode(
+            image_array,
+            cv2.IMREAD_COLOR
+        )
 
         if frame is not None:
             with camera_frame_lock:
@@ -273,11 +302,11 @@ def reset_gesture_state(status_text):
 
     with state_lock:
         current_finger_count = 0
+
         candidate_finger_count = -1
         candidate_frame_count = 0
 
-        # 手離開或比出無效手勢後，
-        # 允許相同手勢下次重新觸發
+        # 手離開畫面後，允許相同手勢再次觸發
         last_sent_finger_count = -1
 
         active_motor_port = -1
@@ -297,46 +326,56 @@ def analyze_puppet_gesture(hand_landmarks):
     global last_command_time
 
     detected_count = count_fingers(hand_landmarks)
+    current_time = time.monotonic()
 
     with state_lock:
         current_finger_count = detected_count
 
-        # 3～5 根手指目前沒有動作，直接解除觸發鎖
+        # 目前只有 1、2、3 根手指具有動作
         if detected_count not in ACTION_MAPPING:
-            candidate_finger_count = detected_count
+            candidate_finger_count = -1
             candidate_frame_count = 0
+
+            # 進入無動作手勢後，
+            # 允許下一次再次觸發相同動作
             last_sent_finger_count = -1
+
             active_motor_port = -1
             current_action_cmd = "NO_ACTION"
             return
 
-        # 判斷目前手勢是否連續穩定
-        if detected_count == candidate_finger_count:
-            candidate_frame_count += 1
-        else:
+        # 手指數量改變，重新開始累積幀數
+        if detected_count != candidate_finger_count:
             candidate_finger_count = detected_count
             candidate_frame_count = 1
+        else:
+            candidate_frame_count += 1
 
         current_action_cmd = (
             f"VERIFY {detected_count}: "
-            f"{candidate_frame_count}/{STABLE_FRAMES_REQUIRED}"
+            f"{candidate_frame_count}/"
+            f"{STABLE_FRAMES_REQUIRED}"
         )
 
-        # 尚未達到穩定幀數
+        # 尚未連續辨識到足夠次數
         if candidate_frame_count < STABLE_FRAMES_REQUIRED:
             return
 
-        # 同一手勢持續維持時，只觸發一次
+        # 同一手勢持續保持時，只觸發一次
         if detected_count == last_sent_finger_count:
             action = ACTION_MAPPING[detected_count]
+
             active_motor_port = action["motor_port"]
-            current_action_cmd = f"{action['action_name']} / HOLD"
+            current_action_cmd = (
+                f"{action['action_name']} / HOLD"
+            )
             return
 
-        current_time = time.monotonic()
-
-        # 防止 Arduino 動作期間收到太密集的命令
-        if current_time - last_command_time < COMMAND_COOLDOWN_SECONDS:
+        # 防止短時間內傳送太多指令
+        if (
+            current_time - last_command_time
+            < COMMAND_COOLDOWN_SECONDS
+        ):
             current_action_cmd = "WAIT_MOTOR"
             return
 
@@ -346,22 +385,25 @@ def analyze_puppet_gesture(hand_landmarks):
         action_name = action["action_name"]
         motor_port = action["motor_port"]
 
-    # 實際序列傳送放在 state_lock 外，
-    # 避免序列埠等待時阻塞畫面狀態讀取
+    # 序列傳送放在 state_lock 外，
+    # 避免序列埠寫入阻塞畫面狀態
     send_success = send_arduino_command(command)
 
     with state_lock:
         if send_success:
             last_sent_finger_count = detected_count
             last_command_time = time.monotonic()
+
             active_motor_port = motor_port
             current_action_cmd = action_name
 
             print(
-                f"手勢觸發：{detected_count} 根手指 "
-                f"→ {action_name} "
-                f"→ PCA9685 通道 {motor_port}"
+                f"手勢確認：{detected_count} 根手指 "
+                f"連續 {STABLE_FRAMES_REQUIRED} 次 "
+                f"→ Arduino 指令 {command} "
+                f"→ {action_name}"
             )
+
         else:
             active_motor_port = -1
             current_action_cmd = "SERIAL_ERROR"
@@ -378,6 +420,8 @@ def vision_thread():
     fps = 0.0
 
     hand_missing_frames = 0
+
+    # 連續幾次找不到手，才視為手已離開
     HAND_MISSING_RESET_FRAMES = 5
 
     while True:
@@ -395,6 +439,7 @@ def vision_thread():
         frame = cv2.flip(frame, 1)
         frame_count += 1
 
+        # 每 10 幀重新計算一次 FPS
         if frame_count % 10 == 0:
             current_time = time.time()
             elapsed_time = current_time - fps_start_time
@@ -404,15 +449,22 @@ def vision_thread():
 
             fps_start_time = current_time
 
-        # 每兩幀執行一次 MediaPipe，降低樹莓派負擔
+        # 每兩幀執行一次 MediaPipe，
+        # 降低 Raspberry Pi 運算負擔
         if frame_count % 2 == 0:
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image_rgb = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB
+            )
+
             results = hands.process(image_rgb)
 
             if results.multi_hand_landmarks:
                 hand_missing_frames = 0
 
-                hand_landmarks = results.multi_hand_landmarks[0]
+                hand_landmarks = (
+                    results.multi_hand_landmarks[0]
+                )
 
                 mp_draw.draw_landmarks(
                     frame,
@@ -420,13 +472,18 @@ def vision_thread():
                     mp_hands.HAND_CONNECTIONS
                 )
 
-                analyze_puppet_gesture(hand_landmarks)
+                analyze_puppet_gesture(
+                    hand_landmarks
+                )
 
             else:
                 hand_missing_frames += 1
 
                 # 避免偶爾漏掉一幀就立刻解除狀態
-                if hand_missing_frames >= HAND_MISSING_RESET_FRAMES:
+                if (
+                    hand_missing_frames
+                    >= HAND_MISSING_RESET_FRAMES
+                ):
                     reset_gesture_state("LOST_HAND")
 
         with state_lock:
@@ -434,6 +491,7 @@ def vision_thread():
             action_text = current_action_cmd
             motor_text = active_motor_port
 
+        # FPS
         cv2.putText(
             frame,
             f"FPS: {fps}",
@@ -444,6 +502,7 @@ def vision_thread():
             2
         )
 
+        # 手指數量
         cv2.putText(
             frame,
             f"Fingers: {finger_text}",
@@ -454,6 +513,7 @@ def vision_thread():
             3
         )
 
+        # 動作狀態
         cv2.putText(
             frame,
             f"CMD: {action_text}",
@@ -464,6 +524,7 @@ def vision_thread():
             2
         )
 
+        # 使用中的 PCA9685 通道
         cv2.putText(
             frame,
             f"Motor: {motor_text}",
@@ -482,7 +543,9 @@ def vision_thread():
 
         if encode_success:
             with output_frame_lock:
-                latest_output_frame = encoded_frame.tobytes()
+                latest_output_frame = (
+                    encoded_frame.tobytes()
+                )
 
 
 # =========================================================
@@ -514,7 +577,10 @@ def generate_frames():
 def index():
     return Response(
         generate_frames(),
-        mimetype="multipart/x-mixed-replace; boundary=frame"
+        mimetype=(
+            "multipart/x-mixed-replace; "
+            "boundary=frame"
+        )
     )
 
 
@@ -526,7 +592,8 @@ def get_command():
             "active_motor": active_motor_port,
             "action": current_action_cmd,
             "arduino_connected": (
-                arduino is not None and arduino.is_open
+                arduino is not None
+                and arduino.is_open
             )
         }
 
